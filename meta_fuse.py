@@ -1,0 +1,1071 @@
+# -*- coding: utf-8 -*-
+"""MetaKneeEnsemble.py  —  v2.0  (Enhanced Multi-Meta-Classifier Fusion)
+=======================================================================
+Meta-Model Pipeline for Knee Osteoarthritis Severity Detection.
+
+Sub-models fused:
+  - Model 1 (PyTorch TorchScript): best_knee_ensemble_cbam.pt
+      → 5-class severity  (EfficientNet-B5 + ResNet18 + CBAM)
+  - Model 2 (Keras .keras)       : final_knee_cnn_model.keras
+      → 5-class severity  (CNN + SE Block)
+  - Model 3 (PyTorch TorchScript): final_mmorphattention.pt
+      → 4-class morphology (ResNet50 + VGG19 + CBAM)
+
+Meta-Classifiers trained & compared (all on same 14-dim feature vector):
+  A) MetaMLPClassifier      — Deep MLP w/ learnable sub-model weights  (PyTorch)
+  B) MetaAttentionMLP       — Self-attention trunk MLP                  (PyTorch)
+  C) RandomForestMeta       — scikit-learn RandomForestClassifier
+  D) XGBoostMeta            — XGBoost XGBClassifier
+  E) SVMMeta                — scikit-learn SVC (RBF kernel, probability)
+  F) GradientBoostingMeta   — scikit-learn GradientBoostingClassifier
+  G) StackedEnsemble        — Logistic-Regression stacker over A-F predictions
+
+Outputs (per sample):
+  Head-A : Severity Grade     (KL Grade 0-4: Normal → Severe)
+  Head-B : Condition Signals  (Osteophytes, Sclerosis, Erosion, Deformity)
+
+Dataset strategy:
+  - Downloads ALL available Kaggle knee-OA datasets (primary + supplemental)
+  - Pools all images, de-duplicates by filename hash
+  - Draws a STRATIFIED 500-image sample for rapid tally / evaluation
+  - Full dataset is used for training the meta classifiers
+"""
+
+# ==============================================================================
+# STEP 1: Kaggle Setup — Download ALL knee datasets
+# ==============================================================================
+print("=" * 70)
+print("[STEP 1/12] Setting up Kaggle and downloading all knee datasets ...")
+print("=" * 70)
+
+import os
+import subprocess
+import zipfile
+import shutil
+import hashlib
+
+os.makedirs(os.path.expanduser("~/.kaggle"), exist_ok=True)
+subprocess.run(["cp", "/content/kaggle.json", os.path.expanduser("~/.kaggle/")], check=True)
+subprocess.run(["chmod", "600", os.path.expanduser("~/.kaggle/kaggle.json")], check=True)
+print("[STEP 1/12] Kaggle credentials configured.")
+
+DOWNLOAD_DIR = "/content"
+POOL_DIR     = "./knee_pool"          # merged pool of ALL images
+os.makedirs(POOL_DIR, exist_ok=True)
+
+# All known Kaggle knee-OA datasets (slug → label-folder search roots)
+KAGGLE_DATASETS = [
+    {
+        "slug"     : "hafiznouman786/annotated-dataset-for-knee-arthritis-detection",
+        "zip_stem" : "annotated-dataset-for-knee-arthritis-detection",
+        "roots"    : ["Training", "training", "train", "."],
+    },
+    {
+        "slug"     : "shashwatwork/knee-osteoarthritis-dataset-with-severity",
+        "zip_stem" : "knee-osteoarthritis-dataset-with-severity",
+        "roots"    : ["train", "Train", "training", "."],
+    },
+    {
+        "slug"     : "tommyngx/kneeoa",
+        "zip_stem" : "kneeoa",
+        "roots"    : ["train", "Train", "."],
+    },
+]
+
+
+def _sha256_prefix(path, nbytes=8192):
+    """Return first-8K SHA-256 hex for quick de-dup."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        h.update(f.read(nbytes))
+    return h.hexdigest()
+
+
+seen_hashes   = set()
+pool_manifest = []   # list of (abs_path, grade_int)
+
+
+def _grade_from_folder(name):
+    """Parse integer KL-grade from folder names like '0Normal', 'Grade2', '3'."""
+    import re
+    m = re.match(r'^(\d+)', name.strip())
+    if m:
+        return int(m.group(1))
+    digits = re.findall(r'\d+', name)
+    if digits and int(digits[0]) <= 4:
+        return int(digits[0])
+    grade_map = {"normal": 0, "doubtful": 1, "mild": 2, "moderate": 3, "severe": 4}
+    for k, v in grade_map.items():
+        if k in name.lower():
+            return v
+    return None
+
+
+def _ingest_root(root_dir, dataset_tag):
+    """Walk root_dir, copy images to pool, return count of added images."""
+    added = 0
+    for folder in sorted(os.listdir(root_dir)):
+        class_dir = os.path.join(root_dir, folder)
+        if not os.path.isdir(class_dir):
+            continue
+        grade = _grade_from_folder(folder)
+        if grade is None:
+            continue
+        grade_pool = os.path.join(POOL_DIR, str(grade))
+        os.makedirs(grade_pool, exist_ok=True)
+        for fname in os.listdir(class_dir):
+            if not fname.lower().endswith(('.png', '.jpg', '.jpeg')):
+                continue
+            src = os.path.join(class_dir, fname)
+            h   = _sha256_prefix(src)
+            if h in seen_hashes:
+                continue
+            seen_hashes.add(h)
+            dst_name = f"{dataset_tag}_{fname}"
+            dst      = os.path.join(grade_pool, dst_name)
+            shutil.copy2(src, dst)
+            pool_manifest.append((dst, grade))
+            added += 1
+    return added
+
+
+for ds in KAGGLE_DATASETS:
+    slug      = ds["slug"]
+    zip_stem  = ds["zip_stem"]
+    roots     = ds["roots"]
+    zip_path  = os.path.join(DOWNLOAD_DIR, f"{zip_stem}.zip")
+    tag       = slug.split("/")[-1][:12]
+
+    print(f"\n[STEP 1/12] Downloading: {slug} ...")
+    try:
+        subprocess.run(
+            ["kaggle", "datasets", "download", "-d", slug, "-p", DOWNLOAD_DIR],
+            check=True
+        )
+        print(f"[STEP 1/12] Extracting {zip_path} ...")
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(DOWNLOAD_DIR)
+    except Exception as ex:
+        print(f"[STEP 1/12] WARNING: Could not download/extract {slug}: {ex}")
+        continue
+
+    ingested = 0
+    for root_cand in roots:
+        root_path = os.path.join(DOWNLOAD_DIR, root_cand)
+        if os.path.isdir(root_path):
+            n = _ingest_root(root_path, tag)
+            ingested += n
+            print(f"[STEP 1/12]   Root '{root_cand}' → {n} unique images ingested.")
+            if n > 0:
+                break
+
+    print(f"[STEP 1/12] Dataset '{tag}': {ingested} images added to pool.")
+
+print(f"\n[STEP 1/12] Pool complete. Total unique images: {len(pool_manifest)}")
+from collections import Counter as _Counter
+_grade_dist = dict(sorted(_Counter(g for _, g in pool_manifest).items()))
+print(f"[STEP 1/12] Grade distribution in pool: {_grade_dist}")
+
+if len(pool_manifest) == 0:
+    raise RuntimeError("[STEP 1/12] FATAL: No images in pool. Check Kaggle credentials and dataset slugs.")
+
+# ==============================================================================
+# STEP 2: Import Libraries
+# ==============================================================================
+print("\n" + "=" * 70)
+print("[STEP 2/12] Importing libraries ...")
+print("=" * 70)
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import random
+import copy
+import re
+import pickle
+import warnings
+warnings.filterwarnings("ignore")
+from collections import Counter
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.metrics import (confusion_matrix, ConfusionMatrixDisplay,
+                             classification_report, accuracy_score)
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import (RandomForestClassifier, GradientBoostingClassifier,
+                               VotingClassifier, StackingClassifier)
+from sklearn.svm import SVC
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+
+try:
+    from xgboost import XGBClassifier
+    HAS_XGB = True
+    print("[STEP 2/12] XGBoost available.")
+except ImportError:
+    HAS_XGB = False
+    print("[STEP 2/12] XGBoost NOT available — installing ...")
+    subprocess.run(["pip", "install", "xgboost", "-q"], check=True)
+    from xgboost import XGBClassifier
+    HAS_XGB = True
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from PIL import Image
+import tensorflow as tf
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[STEP 2/12] Running on device: {DEVICE}")
+print("[STEP 2/12] All libraries imported.")
+
+# ==============================================================================
+# STEP 3: Load the 3 Sub-Models
+# ==============================================================================
+print("\n" + "=" * 70)
+print("[STEP 3/12] Loading sub-models ...")
+print("=" * 70)
+
+MODEL1_PATH = "./mmorphattention_models/best_knee_ensemble_cbam.pt"
+MODEL2_PATH = "./final_knee_cnn_model.keras"
+MODEL3_PATH = "./mmorphattention_models/final_mmorphattention.pt"
+
+print("[STEP 3/12] Loading Model 1 — EfficientNet-B5 + ResNet18 + CBAM (PyTorch TorchScript) ...")
+model1 = torch.jit.load(MODEL1_PATH, map_location=DEVICE)
+model1.eval()
+print("[STEP 3/12] Model 1 loaded ✓")
+
+print("[STEP 3/12] Loading Model 2 — CNN + SE Block (Keras) ...")
+model2_tf = tf.keras.models.load_model(MODEL2_PATH)
+model2_tf.trainable = False
+print("[STEP 3/12] Model 2 loaded ✓")
+model2_tf.summary()
+
+print("[STEP 3/12] Loading Model 3 — ResNet50 + VGG19 + CBAM morphology (PyTorch TorchScript) ...")
+model3 = torch.jit.load(MODEL3_PATH, map_location=DEVICE)
+model3.eval()
+print("[STEP 3/12] Model 3 loaded ✓")
+
+print("[STEP 3/12] All 3 sub-models ready.")
+
+# ==============================================================================
+# STEP 4: Configuration
+# ==============================================================================
+print("\n" + "=" * 70)
+print("[STEP 4/12] Setting configuration ...")
+print("=" * 70)
+
+SEVERITY_CLASSES   = [0, 1, 2, 3, 4]
+SEVERITY_NAMES     = ["Normal", "Doubtful", "Mild", "Moderate", "Severe"]
+NUM_SEVERITY       = 5
+MORPHOLOGY_CLASSES = ["Osteophytes", "Sclerosis", "Erosion", "Deformity"]
+NUM_MORPHOLOGY     = 4
+
+# Feature vector layout: M1(5) | M2(5) | M3(4) = 14
+META_INPUT_DIM  = NUM_SEVERITY + NUM_SEVERITY + NUM_MORPHOLOGY   # 14
+META_HIDDEN_DIM = 128
+BATCH_SIZE      = 16
+NUM_EPOCHS      = 60
+LEARNING_RATE   = 1e-3
+WEIGHT_DECAY    = 1e-4
+PATIENCE        = 12
+
+TALLY_N    = 500    # stratified sample size for quick inference tally
+SAVE_DIR   = "./meta_model_outputs_v2"
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+print(f"[STEP 4/12] Meta input dim    : {META_INPUT_DIM}  (5 + 5 + 4)")
+print(f"[STEP 4/12] Severity classes  : {NUM_SEVERITY}")
+print(f"[STEP 4/12] Morphology heads  : {NUM_MORPHOLOGY}")
+print(f"[STEP 4/12] MLP hidden dim    : {META_HIDDEN_DIM}")
+print(f"[STEP 4/12] Batch / Epochs    : {BATCH_SIZE} / {NUM_EPOCHS}")
+print(f"[STEP 4/12] Tally sample      : {TALLY_N} images (stratified)")
+print(f"[STEP 4/12] Outputs saved to  : {SAVE_DIR}")
+
+# ==============================================================================
+# STEP 5: Preprocessing Helpers
+# ==============================================================================
+print("\n" + "=" * 70)
+print("[STEP 5/12] Defining preprocessing helpers ...")
+print("=" * 70)
+
+transform_pt = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225])
+])
+
+
+def preprocess_for_pt(image_path):
+    """RGB 224×224 tensor for PyTorch models."""
+    img = Image.open(image_path).convert("RGB")
+    return transform_pt(img).unsqueeze(0).to(DEVICE)
+
+
+def preprocess_for_tf(image_path):
+    """Grayscale 256×256 float32 tensor for Keras CNN."""
+    img = tf.io.read_file(image_path)
+    img = tf.image.decode_image(img, channels=1, expand_animations=False)
+    img = tf.image.resize(img, [256, 256])
+    img = tf.cast(img, tf.float32)
+    return tf.expand_dims(img, axis=0)   # (1,256,256,1)
+
+
+# Detect Model 2 output activation
+_m2_last_act = None
+try:
+    _m2_last_act = model2_tf.layers[-1].activation.__name__
+except Exception:
+    pass
+MODEL2_HAS_SOFTMAX = (_m2_last_act == "softmax")
+print(f"[STEP 5/12] Model2 last layer activation: '{_m2_last_act}' "
+      f"| skip extra-softmax={MODEL2_HAS_SOFTMAX}")
+print("[STEP 5/12] Preprocessing helpers defined.")
+
+# ==============================================================================
+# STEP 6: Feature Extraction (14-dim per image)
+# ==============================================================================
+print("\n" + "=" * 70)
+print("[STEP 6/12] Defining feature extraction ...")
+print("=" * 70)
+
+
+def extract_features(image_path):
+    """
+    Return 14-dim numpy float32 feature vector for one image.
+    Layout: [m1_sev(5) | m2_sev(5) | m3_morph(4)]
+    """
+    img_pt = preprocess_for_pt(image_path)
+
+    # Model 1 — severity (5-class softmax)
+    with torch.no_grad():
+        probs1 = F.softmax(model1(img_pt), dim=1).cpu().numpy()[0]
+
+    # Model 2 — severity (5-class)
+    img_tf = preprocess_for_tf(image_path)
+    out2   = model2_tf.predict(img_tf, verbose=0)
+    probs2 = out2[0] if MODEL2_HAS_SOFTMAX else tf.nn.softmax(out2).numpy()[0]
+
+    # Model 3 — morphology (4-class sigmoid)
+    with torch.no_grad():
+        probs3 = torch.sigmoid(model3(img_pt)).cpu().numpy()[0]
+
+    return np.concatenate([probs1, probs2, probs3]).astype(np.float32)
+
+
+print("[STEP 6/12] Feature extraction function defined (14-dim per image).")
+
+# ==============================================================================
+# STEP 7: Build Full Feature Dataset + Stratified 500-Sample Tally
+# ==============================================================================
+print("\n" + "=" * 70)
+print("[STEP 7/12] Building feature dataset from pooled image directory ...")
+print("=" * 70)
+
+all_paths  = [p for p, _ in pool_manifest]
+raw_labels = [g for _, g in pool_manifest]
+
+CLASS_IDS  = sorted(set(raw_labels))
+grade2idx  = {g: i for i, g in enumerate(CLASS_IDS)}
+all_labels = [grade2idx[g] for g in raw_labels]
+
+print(f"[STEP 7/12] Pool size : {len(all_paths)}")
+print(f"[STEP 7/12] Classes   : {CLASS_IDS}  → {SEVERITY_NAMES[:len(CLASS_IDS)]}")
+
+# ---- STRATIFIED 500-image Tally subset ---------------------------------------
+print(f"\n[STEP 7/12] Drawing stratified {TALLY_N}-image tally sample ...")
+tally_paths, tally_labels = [], []
+per_class = max(1, TALLY_N // len(CLASS_IDS))
+for cid in CLASS_IDS:
+    idx_pool = [i for i, l in enumerate(all_labels) if l == grade2idx[cid]]
+    chosen   = random.sample(idx_pool, min(per_class, len(idx_pool)))
+    tally_paths  += [all_paths[i]  for i in chosen]
+    tally_labels += [all_labels[i] for i in chosen]
+
+actual_tally = len(tally_paths)
+print(f"[STEP 7/12] Tally sample size: {actual_tally}")
+print(f"[STEP 7/12] Tally distribution: {dict(sorted(Counter(tally_labels).items()))}")
+
+# ---- Extract features for ALL images -----------------------------------------
+print(f"\n[STEP 7/12] Extracting features for ALL {len(all_paths)} images ...")
+print("[STEP 7/12] (This may take several minutes — runs once, cached in memory)")
+
+all_features = []
+for i, path in enumerate(all_paths, 1):
+    try:
+        feats = extract_features(path)
+    except Exception as ex:
+        print(f"  [STEP 7/12] WARN: {path} failed: {ex} — using zeros.")
+        feats = np.zeros(META_INPUT_DIM, dtype=np.float32)
+    all_features.append(feats)
+    if i % 100 == 0 or i == len(all_paths):
+        print(f"  [STEP 7/12] {i}/{len(all_paths)} extracted ...")
+
+all_features = np.array(all_features, dtype=np.float32)
+print(f"[STEP 7/12] Feature matrix shape: {all_features.shape}")
+
+# ---- Build tally feature matrix (from pre-extracted all_features) ------------
+tally_idx      = [all_paths.index(p) for p in tally_paths]
+X_tally        = all_features[tally_idx]
+y_tally        = np.array(tally_labels)
+print(f"[STEP 7/12] Tally feature matrix: {X_tally.shape}")
+
+# ---- Train / Val / Test split for meta-classifier training -------------------
+X_tv, X_test, y_tv, y_test = train_test_split(
+    all_features, all_labels,
+    test_size=0.15, stratify=all_labels, random_state=42
+)
+X_train, X_val, y_train, y_val = train_test_split(
+    X_tv, y_tv,
+    test_size=0.176, stratify=y_tv, random_state=42    # ~15% of total
+)
+y_train_np = np.array(y_train)
+y_val_np   = np.array(y_val)
+y_test_np  = np.array(y_test)
+
+print(f"\n[STEP 7/12] Split → Train: {len(X_train)}  Val: {len(X_val)}  Test: {len(X_test)}")
+print(f"[STEP 7/12] Train distribution: {dict(sorted(Counter(y_train).items()))}")
+print("[STEP 7/12] Dataset ready.")
+
+# ==============================================================================
+# STEP 8: PyTorch Dataset & DataLoaders
+# ==============================================================================
+print("\n" + "=" * 70)
+print("[STEP 8/12] Creating PyTorch datasets and data loaders ...")
+print("=" * 70)
+
+
+class MetaFeatureDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.long)
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, i):
+        return self.X[i], self.y[i]
+
+
+train_lds  = MetaFeatureDataset(X_train, y_train)
+val_lds    = MetaFeatureDataset(X_val,   y_val)
+test_lds   = MetaFeatureDataset(X_test,  y_test)
+tally_lds  = MetaFeatureDataset(X_tally, y_tally)
+
+train_loader = DataLoader(train_lds, batch_size=BATCH_SIZE, shuffle=True,  drop_last=False)
+val_loader   = DataLoader(val_lds,   batch_size=BATCH_SIZE, shuffle=False)
+test_loader  = DataLoader(test_lds,  batch_size=BATCH_SIZE, shuffle=False)
+tally_loader = DataLoader(tally_lds, batch_size=BATCH_SIZE, shuffle=False)
+
+# Severity class weights
+total_s        = len(y_train)
+cnt_s          = Counter(y_train)
+cls_wts        = [total_s / (len(CLASS_IDS) * cnt_s.get(i, 1)) for i in range(len(CLASS_IDS))]
+cls_wts_tensor = torch.FloatTensor(cls_wts).to(DEVICE)
+print(f"[STEP 8/12] Class weights: {[round(w, 3) for w in cls_wts]}")
+
+NUM_CLS = len(CLASS_IDS)   # actual number of classes present in data
+print(f"[STEP 8/12] DataLoaders ready. Actual #classes: {NUM_CLS}")
+
+# ==============================================================================
+# STEP 9: Meta-Classifier Architectures (PyTorch)
+# ==============================================================================
+print("\n" + "=" * 70)
+print("[STEP 9/12] Defining PyTorch meta-classifier architectures ...")
+print("=" * 70)
+
+# ------------------------------------------------------------------------------
+# A) MetaMLPClassifier — Deep Weighted MLP (2-head)
+# ------------------------------------------------------------------------------
+class MetaMLPClassifier(nn.Module):
+    """
+    Deep Weighted MLP Meta-Classifier.
+    - Learnable per-sub-model scalars (w1, w2, w3)
+    - 3-layer trunk with BN + Dropout
+    - Head-A : severity (N-class)
+    - Head-B : condition signals (4-class sigmoid)
+    """
+    def __init__(self, input_dim=14, hidden_dim=128, num_cls=5, num_morph=4):
+        super().__init__()
+        self.w1 = nn.Parameter(torch.ones(1))
+        self.w2 = nn.Parameter(torch.ones(1))
+        self.w3 = nn.Parameter(torch.ones(1))
+
+        self.trunk = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.BatchNorm1d(hidden_dim // 2), nn.ReLU(), nn.Dropout(0.2),
+        )
+        self.head_sev  = nn.Sequential(nn.Linear(hidden_dim // 2, 32), nn.ReLU(),
+                                       nn.Linear(32, num_cls))
+        self.head_cond = nn.Sequential(nn.Linear(hidden_dim // 2, 32), nn.ReLU(),
+                                       nn.Linear(32, num_morph), nn.Sigmoid())
+
+    def forward(self, x):
+        x1 = x[:, 0:5]   * self.w1
+        x2 = x[:, 5:10]  * self.w2
+        x3 = x[:, 10:14] * self.w3
+        h  = self.trunk(torch.cat([x1, x2, x3], dim=1))
+        return self.head_sev(h), self.head_cond(h)
+
+
+# ------------------------------------------------------------------------------
+# B) MetaAttentionMLP — Self-Attention Token Fusion MLP
+# ------------------------------------------------------------------------------
+class MetaAttentionMLP(nn.Module):
+    """
+    Treats [M1|M2|M3] as 3 tokens, applies multi-head self-attention,
+    then flattens → MLP → dual head.
+    Token sizes: M1=5, M2=5, M3=4 → padded to 5 each → 3 tokens × 5 dims
+    """
+    def __init__(self, token_dim=5, num_heads=1, hidden_dim=128,
+                 num_cls=5, num_morph=4):
+        super().__init__()
+        # Pad M3 from 4→5 dims
+        self.m3_pad = nn.Linear(4, token_dim, bias=False)
+
+        self.attn = nn.MultiheadAttention(embed_dim=token_dim, num_heads=num_heads,
+                                           batch_first=True)
+        self.norm = nn.LayerNorm(token_dim)
+
+        flat_dim = 3 * token_dim   # 15 after attention
+        self.trunk = nn.Sequential(
+            nn.Linear(flat_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim), nn.GELU(), nn.Dropout(0.3),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.BatchNorm1d(hidden_dim // 2), nn.GELU(), nn.Dropout(0.2),
+        )
+        self.head_sev  = nn.Sequential(nn.Linear(hidden_dim // 2, 32), nn.GELU(),
+                                       nn.Linear(32, num_cls))
+        self.head_cond = nn.Sequential(nn.Linear(hidden_dim // 2, 32), nn.GELU(),
+                                       nn.Linear(32, num_morph), nn.Sigmoid())
+
+    def forward(self, x):
+        t1 = x[:, 0:5]                         # (B,5)
+        t2 = x[:, 5:10]                         # (B,5)
+        t3 = self.m3_pad(x[:, 10:14])           # (B,5)
+        tokens = torch.stack([t1, t2, t3], dim=1)  # (B,3,5)
+        attn_out, _ = self.attn(tokens, tokens, tokens)
+        tokens = self.norm(tokens + attn_out)   # residual
+        flat   = tokens.reshape(tokens.size(0), -1)   # (B,15)
+        h = self.trunk(flat)
+        return self.head_sev(h), self.head_cond(h)
+
+
+# Instantiate both PyTorch classifiers
+mlp_meta   = MetaMLPClassifier(input_dim=META_INPUT_DIM, hidden_dim=META_HIDDEN_DIM,
+                                num_cls=NUM_CLS, num_morph=NUM_MORPHOLOGY).to(DEVICE)
+attn_meta  = MetaAttentionMLP(token_dim=5, num_heads=1, hidden_dim=META_HIDDEN_DIM,
+                               num_cls=NUM_CLS, num_morph=NUM_MORPHOLOGY).to(DEVICE)
+
+print("[STEP 9/12] MetaMLPClassifier:")
+print(mlp_meta)
+print("\n[STEP 9/12] MetaAttentionMLP:")
+print(attn_meta)
+
+# ==============================================================================
+# STEP 10: Train PyTorch Meta-Classifiers (MLP + AttentionMLP)
+# ==============================================================================
+print("\n" + "=" * 70)
+print("[STEP 10/12] Training PyTorch meta-classifiers ...")
+print("=" * 70)
+
+criterion_sev  = nn.CrossEntropyLoss(weight=cls_wts_tensor, label_smoothing=0.05)
+criterion_cond = nn.BCELoss()
+
+
+def train_pytorch_meta(model, tag, loader_tr, loader_val,
+                        epochs=NUM_EPOCHS, patience=PATIENCE, lr=LEARNING_RATE):
+    """Train one PyTorch dual-head meta model, return history dict."""
+    opt   = optim.AdamW(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
+    sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-5)
+
+    best_wts      = copy.deepcopy(model.state_dict())
+    best_val_loss = float('inf')
+    no_imp        = 0
+    history       = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
+    best_pth      = os.path.join(SAVE_DIR, f"best_{tag}.pth")
+
+    print(f"\n[STEP 10/12] Training {tag} for up to {epochs} epochs ...")
+    for epoch in range(epochs):
+        # ---- Train ---
+        model.train()
+        run_loss = correct = total = 0
+        for feats, lbls in loader_tr:
+            feats, lbls   = feats.to(DEVICE), lbls.to(DEVICE)
+            morph_targets  = feats[:, 10:14]
+            opt.zero_grad()
+            out_sev, out_cond = model(feats)
+            loss = criterion_sev(out_sev, lbls) + 0.3 * criterion_cond(out_cond, morph_targets)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            run_loss += loss.item()
+            correct  += (out_sev.argmax(1) == lbls).sum().item()
+            total    += lbls.size(0)
+        sched.step()
+        t_loss = run_loss / len(loader_tr)
+        t_acc  = correct / total
+
+        # ---- Validate ---
+        model.eval()
+        rv = vc = vt = 0
+        with torch.no_grad():
+            for feats, lbls in loader_val:
+                feats, lbls   = feats.to(DEVICE), lbls.to(DEVICE)
+                morph_targets  = feats[:, 10:14]
+                out_sev, out_cond = model(feats)
+                vloss = criterion_sev(out_sev, lbls) + 0.3 * criterion_cond(out_cond, morph_targets)
+                rv += vloss.item()
+                vc += (out_sev.argmax(1) == lbls).sum().item()
+                vt += lbls.size(0)
+        v_loss = rv / len(loader_val)
+        v_acc  = vc / vt
+
+        history["train_loss"].append(t_loss)
+        history["val_loss"].append(v_loss)
+        history["train_acc"].append(t_acc)
+        history["val_acc"].append(v_acc)
+
+        print(f"  [{tag}] E{epoch+1:03d}/{epochs} | "
+              f"TrLoss={t_loss:.4f} TrAcc={t_acc:.4f} | "
+              f"VaLoss={v_loss:.4f} VaAcc={v_acc:.4f} | "
+              f"NoImp={no_imp}/{patience}")
+
+        if v_loss < best_val_loss:
+            best_val_loss = v_loss
+            best_wts      = copy.deepcopy(model.state_dict())
+            no_imp        = 0
+            torch.save(model.state_dict(), best_pth)
+        else:
+            no_imp += 1
+        if no_imp >= patience:
+            print(f"  [{tag}] Early stop at epoch {epoch+1}.")
+            break
+
+    model.load_state_dict(best_wts)
+    final_pth = os.path.join(SAVE_DIR, f"final_{tag}.pth")
+    torch.save(model.state_dict(), final_pth)
+    print(f"  [{tag}] Best val loss: {best_val_loss:.4f}  | saved → {final_pth}")
+
+    # Try TorchScript export
+    try:
+        model.eval()
+        cpu_m    = copy.deepcopy(model).cpu()
+        example  = torch.randn(1, META_INPUT_DIM)
+        scripted = torch.jit.trace(cpu_m, example)
+        torch.jit.save(scripted, os.path.join(SAVE_DIR, f"final_{tag}.pt"))
+        print(f"  [{tag}] TorchScript saved.")
+    except Exception as e:
+        print(f"  [{tag}] TorchScript export failed (use .pth): {e}")
+
+    return history, best_val_loss
+
+
+history_mlp,  bvl_mlp  = train_pytorch_meta(mlp_meta,  "meta_mlp",
+                                              train_loader, val_loader)
+history_attn, bvl_attn = train_pytorch_meta(attn_meta, "meta_attn",
+                                              train_loader, val_loader)
+
+# ==============================================================================
+# STEP 11: Train Sklearn Meta-Classifiers (RF, XGB, SVM, GBT, Stacker)
+# ==============================================================================
+print("\n" + "=" * 70)
+print("[STEP 11/12] Training sklearn meta-classifiers ...")
+print("=" * 70)
+
+scaler = StandardScaler()
+X_tr_sc = scaler.fit_transform(X_train)
+X_va_sc = scaler.transform(X_val)
+X_te_sc = scaler.transform(X_test)
+X_ta_sc = scaler.transform(X_tally)
+
+sklearn_classifiers = {}
+
+# ---- C) Random Forest --------------------------------------------------------
+print("\n[STEP 11/12] Training RandomForestClassifier ...")
+rf = RandomForestClassifier(
+    n_estimators=500, max_depth=None, min_samples_split=4,
+    class_weight="balanced", n_jobs=-1, random_state=42
+)
+rf.fit(X_tr_sc, y_train_np)
+rf_va_acc = accuracy_score(y_val_np, rf.predict(X_va_sc))
+print(f"[STEP 11/12] RF Val Acc: {rf_va_acc:.4f}")
+sklearn_classifiers["RandomForest"] = rf
+
+# ---- D) XGBoost --------------------------------------------------------------
+print("\n[STEP 11/12] Training XGBClassifier ...")
+xgb = XGBClassifier(
+    n_estimators=500, max_depth=5, learning_rate=0.05,
+    subsample=0.8, colsample_bytree=0.8,
+    use_label_encoder=False, eval_metric="mlogloss",
+    tree_method="hist", device="cuda" if torch.cuda.is_available() else "cpu",
+    early_stopping_rounds=30, random_state=42
+)
+xgb.fit(X_tr_sc, y_train_np,
+        eval_set=[(X_va_sc, y_val_np)],
+        verbose=50)
+xgb_va_acc = accuracy_score(y_val_np, xgb.predict(X_va_sc))
+print(f"[STEP 11/12] XGB Val Acc: {xgb_va_acc:.4f}")
+sklearn_classifiers["XGBoost"] = xgb
+
+# ---- E) SVM (RBF) ------------------------------------------------------------
+print("\n[STEP 11/12] Training SVC (RBF kernel) ...")
+svm = SVC(kernel="rbf", C=10.0, gamma="scale",
+          class_weight="balanced", probability=True, random_state=42)
+svm.fit(X_tr_sc, y_train_np)
+svm_va_acc = accuracy_score(y_val_np, svm.predict(X_va_sc))
+print(f"[STEP 11/12] SVM Val Acc: {svm_va_acc:.4f}")
+sklearn_classifiers["SVM_RBF"] = svm
+
+# ---- F) Gradient Boosting ----------------------------------------------------
+print("\n[STEP 11/12] Training GradientBoostingClassifier ...")
+gbt = GradientBoostingClassifier(
+    n_estimators=300, max_depth=4, learning_rate=0.05,
+    subsample=0.8, random_state=42
+)
+gbt.fit(X_tr_sc, y_train_np)
+gbt_va_acc = accuracy_score(y_val_np, gbt.predict(X_va_sc))
+print(f"[STEP 11/12] GBT Val Acc: {gbt_va_acc:.4f}")
+sklearn_classifiers["GradientBoosting"] = gbt
+
+# ---- G) Stacking Ensemble (Logistic Regression stacker) ----------------------
+print("\n[STEP 11/12] Building StackingClassifier (LR stacker) ...")
+estimators_for_stack = [
+    ("rf",  RandomForestClassifier(n_estimators=200, class_weight="balanced",
+                                    n_jobs=-1, random_state=42)),
+    ("xgb", XGBClassifier(n_estimators=200, max_depth=5, learning_rate=0.08,
+                           use_label_encoder=False, eval_metric="mlogloss",
+                           tree_method="hist", random_state=42)),
+    ("svm", SVC(kernel="rbf", C=10, gamma="scale",
+                class_weight="balanced", probability=True, random_state=42)),
+    ("gbt", GradientBoostingClassifier(n_estimators=150, max_depth=4,
+                                        learning_rate=0.08, random_state=42)),
+]
+stacker = StackingClassifier(
+    estimators=estimators_for_stack,
+    final_estimator=LogisticRegression(max_iter=1000, C=1.0,
+                                        class_weight="balanced", random_state=42),
+    cv=5, passthrough=False, n_jobs=-1
+)
+stacker.fit(X_tr_sc, y_train_np)
+stk_va_acc = accuracy_score(y_val_np, stacker.predict(X_va_sc))
+print(f"[STEP 11/12] Stacker Val Acc: {stk_va_acc:.4f}")
+sklearn_classifiers["StackedEnsemble"] = stacker
+
+# Save sklearn models
+for name, clf in sklearn_classifiers.items():
+    pkl_path = os.path.join(SAVE_DIR, f"meta_{name.lower()}.pkl")
+    with open(pkl_path, "wb") as f:
+        pickle.dump({"clf": clf, "scaler": scaler}, f)
+    print(f"[STEP 11/12] Saved {name} → {pkl_path}")
+
+print("\n[STEP 11/12] All sklearn meta-classifiers trained and saved.")
+
+# ==============================================================================
+# STEP 12: Evaluation + Comparison + Inference Dashboard
+# ==============================================================================
+print("\n" + "=" * 70)
+print("[STEP 12/12] Full Evaluation — Test Set + Stratified 500-Tally + Dashboard")
+print("=" * 70)
+
+# ---- Helper: PyTorch model inference -----------------------------------------
+
+def pt_predict_proba(model, loader):
+    """Return (preds_idx, probs_sev, probs_cond, true_labels) numpy arrays."""
+    model.eval()
+    all_preds, all_true, all_sev, all_cond = [], [], [], []
+    with torch.no_grad():
+        for feats, lbls in loader:
+            feats = feats.to(DEVICE)
+            out_s, out_c = model(feats)
+            probs_s = F.softmax(out_s, dim=1).cpu().numpy()
+            all_sev.extend(probs_s)
+            all_cond.extend(out_c.cpu().numpy())
+            all_preds.extend(probs_s.argmax(axis=1))
+            all_true.extend(lbls.numpy())
+    return (np.array(all_preds), np.array(all_sev),
+            np.array(all_cond),  np.array(all_true))
+
+
+# ---- Collect results on TEST set ---------------------------------------------
+results_test = {}
+
+# PyTorch models
+for tag, model in [("MetaMLP", mlp_meta), ("MetaAttention", attn_meta)]:
+    preds, sev_p, cond_p, true = pt_predict_proba(model, test_loader)
+    acc = accuracy_score(true, preds)
+    results_test[tag] = {"preds": preds, "true": true, "acc": acc,
+                          "sev_probs": sev_p, "cond_probs": cond_p}
+    print(f"[STEP 12/12] {tag:20s} Test Acc: {acc*100:.2f}%")
+
+# Sklearn models
+for name, clf in sklearn_classifiers.items():
+    preds = clf.predict(X_te_sc)
+    acc   = accuracy_score(y_test_np, preds)
+    results_test[name] = {"preds": preds, "true": y_test_np, "acc": acc}
+    print(f"[STEP 12/12] {name:20s} Test Acc: {acc*100:.2f}%")
+
+# ---- Collect results on TALLY-500 -------------------------------------------
+print(f"\n[STEP 12/12] Running inference on {actual_tally}-image stratified tally ...")
+results_tally = {}
+
+# PyTorch
+for tag, model in [("MetaMLP", mlp_meta), ("MetaAttention", attn_meta)]:
+    preds, sev_p, cond_p, true = pt_predict_proba(model, tally_loader)
+    acc = accuracy_score(true, preds)
+    results_tally[tag] = {"preds": preds, "true": true, "acc": acc,
+                           "sev_probs": sev_p, "cond_probs": cond_p}
+    print(f"[STEP 12/12] TALLY {tag:20s} Acc: {acc*100:.2f}%")
+
+# Sklearn
+for name, clf in sklearn_classifiers.items():
+    preds = clf.predict(X_ta_sc)
+    acc   = accuracy_score(y_tally, preds)
+    results_tally[name] = {"preds": preds, "true": np.array(y_tally), "acc": acc}
+    print(f"[STEP 12/12] TALLY {name:20s} Acc: {acc*100:.2f}%")
+
+
+# ---- 12.1: Training curves (MLP + Attention) ---------------------------------
+print("\n[STEP 12/12] Saving PyTorch training curves ...")
+fig, axes = plt.subplots(2, 2, figsize=(14, 8))
+for col, (tag, hist) in enumerate([("MetaMLP", history_mlp),
+                                     ("MetaAttentionMLP", history_attn)]):
+    axes[0, col].plot(hist["train_loss"], label="Train", color="steelblue")
+    axes[0, col].plot(hist["val_loss"],   label="Val",   color="orange")
+    axes[0, col].set_title(f"{tag} — Loss");   axes[0, col].legend()
+    axes[1, col].plot(hist["train_acc"],  label="Train", color="seagreen")
+    axes[1, col].plot(hist["val_acc"],    label="Val",   color="crimson")
+    axes[1, col].set_title(f"{tag} — Accuracy"); axes[1, col].legend()
+plt.suptitle("Meta-Classifier Training Curves", fontweight="bold", fontsize=14)
+plt.tight_layout()
+curves_path = os.path.join(SAVE_DIR, "meta_training_curves.png")
+plt.savefig(curves_path, dpi=150)
+plt.show()
+print(f"[STEP 12/12] Training curves saved → {curves_path}")
+
+
+# ---- 12.2: Accuracy Comparison bar chart (Test + Tally) ----------------------
+print("\n[STEP 12/12] Saving accuracy comparison chart ...")
+clf_names = list(results_test.keys())
+test_accs  = [results_test[n]["acc"]  * 100 for n in clf_names]
+tally_accs = [results_tally[n]["acc"] * 100 for n in clf_names]
+
+x   = np.arange(len(clf_names))
+w   = 0.35
+fig, ax = plt.subplots(figsize=(13, 5))
+bars1 = ax.bar(x - w/2, test_accs,  w, label="Test Set",      color="steelblue",  alpha=0.85)
+bars2 = ax.bar(x + w/2, tally_accs, w, label=f"Tally-{actual_tally}", color="darkorange", alpha=0.85)
+ax.set_xticks(x); ax.set_xticklabels(clf_names, rotation=18, ha="right", fontsize=9)
+ax.set_ylim(0, 105); ax.set_ylabel("Accuracy (%)"); ax.legend()
+ax.set_title("Meta-Classifier Comparison — Test vs Tally-500 Accuracy", fontweight="bold")
+for bar in list(bars1) + list(bars2):
+    h = bar.get_height()
+    ax.text(bar.get_x() + bar.get_width()/2, h + 0.5, f"{h:.1f}%",
+            ha="center", va="bottom", fontsize=8)
+plt.tight_layout()
+cmp_path = os.path.join(SAVE_DIR, "meta_accuracy_comparison.png")
+plt.savefig(cmp_path, dpi=150)
+plt.show()
+print(f"[STEP 12/12] Accuracy comparison saved → {cmp_path}")
+
+
+# ---- 12.3: Confusion matrices for all classifiers ----------------------------
+print("\n[STEP 12/12] Saving confusion matrices ...")
+n_clf   = len(clf_names)
+fig, axes = plt.subplots(2, n_clf, figsize=(4 * n_clf, 8))
+display_labels = [f"G{CLASS_IDS[i]}" for i in range(NUM_CLS)]
+
+for col, name in enumerate(clf_names):
+    for row, (split_tag, res) in enumerate([("Test", results_test),
+                                             (f"Tally-{actual_tally}", results_tally)]):
+        cm   = confusion_matrix(res[name]["true"], res[name]["preds"])
+        disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=display_labels)
+        disp.plot(cmap=plt.cm.Blues, values_format="d", ax=axes[row, col], colorbar=False)
+        axes[row, col].set_title(f"{name}\n{split_tag}", fontsize=8)
+
+plt.suptitle("Confusion Matrices — All Meta-Classifiers", fontweight="bold")
+plt.tight_layout()
+cm_path = os.path.join(SAVE_DIR, "meta_all_confusion_matrices.png")
+plt.savefig(cm_path, dpi=120, bbox_inches="tight")
+plt.show()
+print(f"[STEP 12/12] Confusion matrices saved → {cm_path}")
+
+
+# ---- 12.4: Classification reports -------------------------------------------
+print("\n[STEP 12/12] Classification Reports (Test Set) ...")
+report_lines = []
+target_names = [f"Gr{CLASS_IDS[i]} {SEVERITY_NAMES[i]}" for i in range(NUM_CLS)]
+for name in clf_names:
+    r = results_test[name]
+    rep = classification_report(r["true"], r["preds"], target_names=target_names)
+    print(f"\n{'─'*60}")
+    print(f"  {name}  |  Test Acc: {r['acc']*100:.2f}%")
+    print(f"{'─'*60}")
+    print(rep)
+    report_lines += [f"\n{'─'*60}\n{name}  Test Acc: {r['acc']*100:.2f}%\n{'─'*60}\n", rep]
+
+report_txt = os.path.join(SAVE_DIR, "meta_classification_reports.txt")
+with open(report_txt, "w") as f:
+    f.writelines(report_lines)
+print(f"[STEP 12/12] Classification reports saved → {report_txt}")
+
+
+# ---- 12.5: Inference Dashboard — 5 random tally samples ----------------------
+print("\n[STEP 12/12] Generating inference dashboards for 5 random tally samples ...")
+
+# Identify best PyTorch model by tally accuracy
+best_pt_tag   = max(["MetaMLP", "MetaAttention"],
+                     key=lambda t: results_tally[t]["acc"])
+best_pt_model = mlp_meta if best_pt_tag == "MetaMLP" else attn_meta
+print(f"[STEP 12/12] Best PyTorch model for dashboard: {best_pt_tag}")
+
+sample_indices = random.sample(range(actual_tally), min(5, actual_tally))
+
+for si, idx in enumerate(sample_indices, 1):
+    img_path   = tally_paths[idx]
+    true_idx   = y_tally[idx]
+    true_grade = CLASS_IDS[true_idx]
+    feats_np   = X_tally[idx]
+
+    feat_tensor = torch.tensor(feats_np, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+    best_pt_model.eval()
+    with torch.no_grad():
+        out_s, out_c = best_pt_model(feat_tensor)
+        sev_probs    = F.softmax(out_s, dim=1).cpu().numpy()[0]
+        cond_probs   = out_c.cpu().numpy()[0]
+
+    pred_idx   = int(np.argmax(sev_probs))
+    pred_grade = CLASS_IDS[pred_idx]
+    correct    = pred_grade == true_grade
+    result_str = "CORRECT ✓" if correct else "WRONG ✗"
+
+    # Collect predictions from all classifiers for this sample
+    all_clf_preds = {}
+    for name in clf_names:
+        r = results_tally[name]
+        all_clf_preds[name] = r["preds"][idx]
+
+    print(f"\n[STEP 12/12] Dashboard {si}/5 | "
+          f"True: Grade {true_grade} ({SEVERITY_NAMES[true_idx]}) | "
+          f"[{best_pt_tag}] Pred: Grade {pred_grade} | [{result_str}]")
+
+    # ---- Plot ----------------------------------------------------------------
+    fig = plt.figure(figsize=(20, 6))
+    gs  = gridspec.GridSpec(1, 4, width_ratios=[1.2, 1.2, 1.4, 1.2])
+
+    # Panel 0 — Original Image
+    ax_img = plt.subplot(gs[0])
+    try:
+        img_disp = Image.open(img_path).convert("RGB")
+        img_disp = img_disp.resize((224, 224))
+        ax_img.imshow(img_disp)
+    except Exception:
+        ax_img.text(0.5, 0.5, "Image\nUnavailable", ha="center", va="center",
+                    transform=ax_img.transAxes, fontsize=12)
+    ax_img.set_title(f"Input Image\nTrue: Grade {true_grade} ({SEVERITY_NAMES[true_idx]})",
+                     fontweight="bold")
+    ax_img.axis("off")
+
+    # Panel 1 — Severity probs (best PyTorch)
+    ax_sev = plt.subplot(gs[1])
+    cols_bar = ['#27ae60' if i == pred_idx else '#2980b9' for i in range(NUM_CLS)]
+    bars = ax_sev.bar(SEVERITY_NAMES[:NUM_CLS], sev_probs, color=cols_bar, alpha=0.85)
+    ax_sev.set_ylim(0, 1.05)
+    ax_sev.axhline(0.5, color="gray", linestyle="--", linewidth=0.8)
+    ax_sev.set_title(f"Head-A: Severity\n{best_pt_tag} → Grade {pred_grade}", fontweight="bold")
+    ax_sev.set_ylabel("Probability")
+    for bar in bars:
+        h = bar.get_height()
+        ax_sev.text(bar.get_x() + bar.get_width()/2, h + 0.01,
+                    f"{h:.2f}", ha="center", va="bottom", fontsize=8)
+
+    # Panel 2 — Condition signals
+    ax_cond = plt.subplot(gs[2])
+    cond_cols = ['#e74c3c' if p > 0.5 else '#3498db' for p in cond_probs]
+    bars2 = ax_cond.bar(MORPHOLOGY_CLASSES, cond_probs, color=cond_cols, alpha=0.85)
+    ax_cond.set_ylim(0, 1.05)
+    ax_cond.axhline(0.5, color="gray", linestyle="--", linewidth=0.8)
+    ax_cond.set_title("Head-B: Condition Signals\n(Red = Positive)", fontweight="bold")
+    ax_cond.set_ylabel("Confidence")
+    for bar in bars2:
+        h = bar.get_height()
+        ax_cond.text(bar.get_x() + bar.get_width()/2, h + 0.01,
+                     f"{h:.2f}", ha="center", va="bottom", fontsize=8)
+
+    # Panel 3 — All classifier predictions text
+    ax_rep = plt.subplot(gs[3])
+    ax_rep.axis("off")
+    wts = (getattr(best_pt_model, "w1", None),
+           getattr(best_pt_model, "w2", None),
+           getattr(best_pt_model, "w3", None))
+    report = (
+        f"=== ENSEMBLE REPORT ===\n\n"
+        f"True Grade : {true_grade} ({SEVERITY_NAMES[true_idx]})\n"
+        f"Tally idx  : {idx}/{actual_tally}\n\n"
+        f"--- All Classifier Predictions ---\n"
+    )
+    for cname, cpred in all_clf_preds.items():
+        marker = "✓" if CLASS_IDS[cpred] == true_grade else "✗"
+        report += f"{cname[:18]:<19}: G{CLASS_IDS[cpred]} {marker}\n"
+    if wts[0] is not None:
+        report += (
+            f"\n--- Sub-model Weights ({best_pt_tag}) ---\n"
+            f"M1 EfficientNet: {wts[0].item():.3f}\n"
+            f"M2 CNN+SE      : {wts[1].item():.3f}\n"
+            f"M3 ResNet+VGG  : {wts[2].item():.3f}\n\n"
+        )
+    report += f"--- Condition Signals ---\n"
+    for cls, prob in zip(MORPHOLOGY_CLASSES, cond_probs):
+        bar_str = "█" * int(prob * 10) + "░" * (10 - int(prob * 10))
+        status  = "POSITIVE" if prob > 0.5 else "negative"
+        report += f"{cls[:11]:<12}: {prob*100:4.1f}% {bar_str} {status}\n"
+
+    ax_rep.text(0.03, 0.97, report, fontsize=7.5, family="monospace",
+                verticalalignment="top", transform=ax_rep.transAxes,
+                bbox=dict(boxstyle="round,pad=0.4", facecolor="#f0f4f8",
+                          edgecolor="#aab0bb", alpha=0.9))
+
+    correct_counts = sum(1 for cpred in all_clf_preds.values()
+                         if CLASS_IDS[cpred] == true_grade)
+    plt.suptitle(
+        f"Meta Ensemble Inference — Tally Sample {si}/5  "
+        f"[True: G{true_grade}]  |  "
+        f"Classifiers agree: {correct_counts}/{len(all_clf_preds)}  [{result_str}]",
+        fontweight="bold", fontsize=12
+    )
+    plt.tight_layout()
+    dash_path = os.path.join(SAVE_DIR, f"meta_inference_tally_{si}.png")
+    plt.savefig(dash_path, dpi=120, bbox_inches="tight")
+    plt.show()
+    print(f"[STEP 12/12] Dashboard {si} saved → {dash_path}")
+
+
+# ---- 12.6: Final leaderboard -------------------------------------------------
+print(f"\n{'=' * 70}")
+print("[DONE] FINAL LEADERBOARD")
+print(f"{'=' * 70}")
+hdr = f"{'Classifier':<22} {'Test Acc':>10} {'Tally-500 Acc':>15}"
+print(hdr)
+print("─" * len(hdr))
+for name in clf_names:
+    ta = results_test[name]["acc"]  * 100
+    ra = results_tally[name]["acc"] * 100
+    print(f"{name:<22} {ta:>9.2f}%  {ra:>13.2f}%")
+
+best_test  = max(clf_names, key=lambda n: results_test[n]["acc"])
+best_tally = max(clf_names, key=lambda n: results_tally[n]["acc"])
+print(f"\n  ★ Best on Test    : {best_test}  ({results_test[best_test]['acc']*100:.2f}%)")
+print(f"  ★ Best on Tally   : {best_tally}  ({results_tally[best_tally]['acc']*100:.2f}%)")
+
+print(f"\n[DONE] All files saved in {SAVE_DIR}/:")
+for f in sorted(os.listdir(SAVE_DIR)):
+    size_mb = os.path.getsize(os.path.join(SAVE_DIR, f)) / 1e6
+    print(f"  {f}  ({size_mb:.2f} MB)")
+print(f"{'=' * 70}")
+print("[DONE] MetaKneeEnsemble pipeline finished successfully.")
